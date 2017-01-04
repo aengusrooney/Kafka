@@ -1,0 +1,204 @@
+#!/bin/bash
+####
+# Mirrormaker DR script
+####
+
+# Check commandline parsing
+function print_usage {
+  echo -e "Usage: $( basename "$0" ) NAMESERVICE\n"  
+  echo "Kafka MirrorMaker daemon. Please run from a broker node."
+  echo "Specify the nameservice on the commandline of the cluster the node belongs to."
+  echo "The following files must exist for the nameservice: consumer.properties.nameservice, producer.properties.nameservice, mirrormaker_dr.conf.nameservice"
+  exit 1
+}
+if [ -z "$1" ]; then
+  print_usage
+fi
+
+#
+# Source config file
+#
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+conf_file="$DIR/mirrormaker_dr.conf"
+if [ ! -f "$conf_file" ]; then
+  echo "Config file not found at: $conf_file"
+  exit 1
+fi
+source "$conf_file"
+echo "Got config from: $conf_file"
+cluster_conf_file="$DIR/mirrormaker_dr.conf.${1}"
+if [ ! -f "$cluster_conf_file" ]; then
+  echo "Config file not found at: $cluster_conf_file"
+  print_usage
+fi
+source "$cluster_conf_file"
+echo "This cluster is: $this_cluster_nameservice"
+
+# Set the properties file paths and test they exist
+consumer_properties="consumer.properties.${this_cluster_nameservice}"
+producer_properties="producer.properties.${this_cluster_nameservice}"
+consumer_properties_file="$DIR/${consumer_properties}"
+if [ ! -f "$consumer_properties_file" ]; then
+  echo "Consumer properties file not found at: $consumer_properties_file"
+  print_usage
+fi
+producer_properties_file="$DIR/${producer_properties}"
+if [ ! -f "$producer_properties_file" ]; then
+  echo "Producer properties file not found at: $producer_properties_file"
+  print_usage
+fi
+
+#
+# Define functions
+#
+function kill_mm {
+  pid="$( cat "$pid_file" )"
+  if [ "$pid" != "" ] && [ "$( ps -ef | grep -v grep |grep "$pid" | grep kafka.tools.MirrorMaker | wc -l )" == "1" ]; then
+    echo "Killing mirrormaker process with pid: $pid"
+    kill -9 "$pid"
+    sleep 1
+  fi
+  if [ "$( ps -ef | grep -v grep | grep kafka.tools.MirrorMaker | wc -l )" != "0" ]; then
+    echo "Warning: A mirrormaker PID is still alive"
+  fi
+  truncate -s 0 "$pid_file"
+  truncate -s 0 "$registered_topics"
+}
+function kill_mm_and_exit {
+  kill_mm
+  exit 1
+}
+
+function clean_stop_mm_and_exit {
+  kill_mm
+  if [ "$( ps -ef | grep -v grep | grep kafka.tools.MirrorMaker | wc -l )" != "0" ]; then
+    exit 1
+  fi
+  exit 0
+}
+
+function start_new {
+  if [ "$( ps -ef | grep -v grep | grep kafka.tools.MirrorMaker | wc -l )" != "0" ]; then
+    echo "Cannot start new MM process as an existing one is still running"
+    exit 1
+  fi
+  echo "Starting new mirrormaker process"
+  nohup ${run_class} kafka.tools.MirrorMaker --consumer.config "${consumer_properties_file}" --producer.config "${producer_properties_file}" --whitelist "$topic_whitelist_pattern" &>/dev/null & echo $! > "$pid_file"
+  ${kafka_topics} --list --zookeeper "${zk_string}" | grep "$topic_whitelist_pattern" > "$registered_topics"
+  exit 0
+}
+
+function check_old_and_exit {
+  pid="$( cat "$pid_file" )"
+  if [ "$pid" != "" ] && [ "$( ps -ef | grep -v grep |grep "$pid" | grep kafka.tools.MirrorMaker | wc -l )" == "1" ]; then
+    echo "Existing mirrormaker process is okay"
+    exit 0
+  fi
+  echo "Existing mirrormaker process not found. Starting a new one."
+  start_new
+}
+
+function stop_and_start_new {
+  kill_mm
+  start_new
+}
+
+function check_file_exists {
+  for nn in "$1" "$2"; do
+   webhdfs_query="${webhdfs_protocol}://${nn}:${webhdfs_port}/webhdfs/v1${primary_marker_file}?op=GETFILESTATUS"
+   echo "Testing file at: $webhdfs_query"
+   webhdfs_output="$(curl -i -k --negotiate -u : "${webhdfs_protocol}://${nn}:${webhdfs_port}/webhdfs/v1${primary_marker_file}?op=GETFILESTATUS")"
+   if [ "$?" != "0" ]; then
+     echo "Could not query: $nn"
+     echo "$webhdfs_output"
+   elif [ "$( echo $webhdfs_output | grep "java.io.FileNotFoundException" | wc -l)" == "1" ]; then
+     echo "No primary marker found on: $nn"
+     return 1
+   elif [ "$( echo $webhdfs_output | grep "org.apache.hadoop.ipc.StandbyException" | wc -l)" == "1" ]; then
+     echo "Namenode in standby: $nn"
+   elif [ "$( echo $webhdfs_output | grep "FileStatus" | wc -l)" == "1" ]; then
+     echo "Marker file found on: $nn"
+     return 0
+   fi
+  done
+  echo "Could not query any namenodes for file status"
+  return 6
+}
+
+#
+# Kinit as kafka
+#
+if [ ! -f "$kafka_keytab" ]; then
+  echo "Keytab not found at: $kafka_keytab"
+  exit 1
+fi
+principal="kafka/$(hostname -f)"
+kinit -kt "$kafka_keytab" "$principal"
+if [ "$?" != "0" ]; then
+  echo "Could not kinit as $principal with $kafka_keytab"
+  exit 1
+fi
+echo -e "kinit'ed as $principal with $kafka_keytab"
+
+
+#
+# Check if this cluster is primary
+#
+
+check_file_exists "$this_nn1" "$this_nn2"
+this_primary_status="$?"
+check_file_exists "$that_nn1" "$that_nn2"
+that_primary_status="$?"
+
+if [ "$this_primary_status" -gt "1" ]; then
+  echo "Could not test file status to webhdfs on: $this_nn1 $this_nn2"
+  kill_mm_and_exit
+elif [ "$that_primary_status" -gt "1" ]; then
+  echo "Could not test file status to webhdfs on: $that_nn1 $that_nn2"
+  kill_mm_and_exit
+elif [ "$this_primary_status" == "1" ] && [ "$that_primary_status" == "1" ]; then
+  echo "Error: No clusters marked as primary."
+  kill_mm_and_exit
+elif [ "$this_primary_status" == "0" ] && [ "$that_primary_status" == "0" ]; then
+  echo "Error: Both cluster marked as primary"
+  kill_mm_and_exit
+elif [ "$this_primary_status" == "1" ] && [ "$that_primary_status" == "0" ]; then
+  echo "Other cluster marked as primary"
+  clean_stop_mm_and_exit
+fi
+
+echo "This cluster is primary."
+
+###
+# Check writability of pids etc
+###
+if [ ! -d "${pid_folder}" ]; then
+  echo "Cannot write into PID folder: ${pid_folder}"
+  kill_mm_and_exit
+fi
+
+touch -a "$pid_file"
+if [ "$?" != "0" ]; then
+  echo "Cannot write to PID file: $pid_file"
+  kill_mm_and_exit
+fi
+
+touch -a "$registered_topics"
+if [ "$?" != "0" ]; then
+  echo "Cannot write to registered topics file: $registered_topics"
+  kill_mm_and_exit
+fi
+
+###
+# Check if current MM process is okay
+###
+new_topics_hash="$( ${kafka_topics} --list --zookeeper "${zk_string}" | grep "$topic_whitelist_pattern" | md5sum )"
+old_topics_hash="$( cat "$registered_topics" | md5sum )"
+
+if [ "$new_topics_hash" != "$old_topics_hash" ]; then
+  echo "Starting new mirrormaker process as one is not running or topics have been updated"
+  stop_and_start_new
+else
+  echo "Existing mirrormaker process looks good. Checking health."
+  check_old_and_exit
+fi
